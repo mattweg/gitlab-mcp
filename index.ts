@@ -303,15 +303,72 @@ const createCookieJar = (): CookieJar | null => {
   }
 };
 
-// Initialize cookie jar and fetch
-const cookieJar = createCookieJar();
-const fetch = cookieJar ? fetchCookie(nodeFetch, cookieJar) : nodeFetch;
+// Initialize cookie jar and fetch with refresh tracking
+let cookieJar = createCookieJar();
+let fetch = cookieJar ? fetchCookie(nodeFetch, cookieJar) : nodeFetch;
+let lastCookieFileModTime = 0;
+
+// Function to refresh cookie jar from file if it has been modified
+const refreshCookieJarIfNeeded = (): void => {
+  if (!GITLAB_AUTH_COOKIE_PATH) return;
+
+  try {
+    const cookiePath = GITLAB_AUTH_COOKIE_PATH.startsWith("~/")
+      ? path.join(process.env.HOME || "", GITLAB_AUTH_COOKIE_PATH.slice(2))
+      : GITLAB_AUTH_COOKIE_PATH;
+
+    const stats = fs.statSync(cookiePath);
+    const currentModTime = stats.mtime.getTime();
+
+    // Only refresh if the file has been modified since last check
+    if (currentModTime > lastCookieFileModTime) {
+      lastCookieFileModTime = currentModTime;
+      cookieJar = createCookieJar();
+      fetch = cookieJar ? fetchCookie(nodeFetch, cookieJar) : nodeFetch;
+      console.debug(
+        `Cookie jar refreshed due to file modification at ${new Date(currentModTime).toISOString()}`
+      );
+    }
+  } catch (error) {
+    console.debug("Error checking cookie file modification time:", error);
+  }
+};
 
 // Ensure session is established for the current request
 async function ensureSessionForRequest(): Promise<void> {
-  // Session establishment disabled - direct API calls work better
-  // with cookie + token authentication
-  return;
+  if (!GITLAB_AUTH_COOKIE_PATH) return;
+
+  // Refresh cookie jar if the file has been modified
+  refreshCookieJarIfNeeded();
+
+  if (!cookieJar) return;
+
+  // Check if we need to establish a session by testing a simple API call
+  try {
+    const response = await fetch(`${GITLAB_API_URL}/user`, {
+      ...DEFAULT_FETCH_CONFIG,
+      method: "GET",
+    });
+
+    // If we get a 401, we need to establish a session
+    if (response.status === 401) {
+      console.debug("Session establishment needed due to 401 response");
+
+      // Make a request that will trigger cookie-based authentication
+      await fetch(`${GITLAB_API_URL}/projects`, {
+        ...DEFAULT_FETCH_CONFIG,
+        method: "GET",
+      }).catch(() => {
+        // Ignore errors - the important thing is that cookies get refreshed
+        console.debug("Session establishment request completed");
+      });
+
+      // Small delay to ensure cookies are processed
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
+  } catch (error) {
+    console.debug("Error during session establishment:", error);
+  }
 }
 
 // Modify DEFAULT_HEADERS to include agent configuration
@@ -319,14 +376,23 @@ const DEFAULT_HEADERS: Record<string, string> = {
   Accept: "application/json",
   "Content-Type": "application/json",
 };
-// Include both headers for maximum compatibility with enterprise GitLab
-DEFAULT_HEADERS["Private-Token"] = `${GITLAB_PERSONAL_ACCESS_TOKEN}`;
-DEFAULT_HEADERS["Authorization"] = `Bearer ${GITLAB_PERSONAL_ACCESS_TOKEN}`;
+// Set authentication headers based on GitLab version
+if (IS_OLD) {
+  DEFAULT_HEADERS["Private-Token"] = `${GITLAB_PERSONAL_ACCESS_TOKEN}`;
+} else {
+  DEFAULT_HEADERS["Authorization"] = `Bearer ${GITLAB_PERSONAL_ACCESS_TOKEN}`;
+}
+
+// For GitLab with cookie auth, include both headers for compatibility
+if (GITLAB_AUTH_COOKIE_PATH) {
+  DEFAULT_HEADERS["Private-Token"] = `${GITLAB_PERSONAL_ACCESS_TOKEN}`;
+  DEFAULT_HEADERS["Authorization"] = `Bearer ${GITLAB_PERSONAL_ACCESS_TOKEN}`;
+}
 
 // Create a default fetch configuration object that includes proxy agents if set
 const DEFAULT_FETCH_CONFIG = {
   headers: DEFAULT_HEADERS,
-  redirect: 'follow' as RequestRedirect, // Always follow redirects for enterprise GitLab authentication
+  redirect: 'follow' as RequestRedirect, // Always follow redirects for GitLab authentication
   agent: (parsedUrl: URL) => {
     if (parsedUrl.protocol === "https:") {
       return httpsAgent;
